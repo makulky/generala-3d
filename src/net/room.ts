@@ -1,13 +1,31 @@
 import type { DataConnection, Peer as PeerType } from 'peerjs';
 import { createGame, reduce, type Action, type GameState, type Player, type Seat } from '../game/state';
 import { decodeFrame, type NetMessage } from './protocol';
+import type { RelayLink } from './relay';
 
 const PREFIX = 'generala3d-sala-';
 const CONNECT_TIMEOUT = 12_000;
+/** Tiempo que se da a la conexión directa antes de probar también el respaldo. */
+const FALLBACK_AFTER = 7000;
+const HELLO_EVERY = 2500;
+const RESYNC_EVERY = 3000;
 const GIVE_UP_AFTER = 45_000;
+
+/**
+ * Solo STUN: los servidores TURN que PeerJS trae por defecto ya no existen.
+ * Si no hay ruta directa, entra en juego el respaldo de `relay.ts`.
+ */
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+
+/** En desarrollo, `?relay` obliga a usar el respaldo para poder probarlo. */
+const FORCE_RELAY = import.meta.env.DEV && new URLSearchParams(location.search).has('relay');
 
 export type RoomStatus =
   | { kind: 'connecting' }
+  | { kind: 'fallback' }
   | { kind: 'waiting-peer' }
   | { kind: 'connected' }
   | { kind: 'reconnecting' }
@@ -22,6 +40,13 @@ interface Session {
 }
 
 type Role = Session['role'];
+
+/** Lo que Room necesita de una conexión, sea directa o por el respaldo. */
+interface Link {
+  readonly open: boolean;
+  send(data: NetMessage | ArrayBuffer): void;
+  close(): void;
+}
 
 const key = (code: string, role: Role) => `generala:sala:${code}:${role}`;
 
@@ -67,9 +92,10 @@ export async function resumeSession(code: string): Promise<{ role: Role; player:
   return null;
 }
 
+/** El código también es la clave del respaldo: debe ser difícil de adivinar. */
 export function newCode(): string {
   const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(5));
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
   return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
 }
 
@@ -86,20 +112,25 @@ export interface RoomEvents {
 }
 
 /**
- * Sala para dos jugadores sobre WebRTC. El anfitrión guarda el estado válido:
- * valida cada acción y la reenvía. Las poses de los dados van directas entre
- * los dos navegadores.
+ * Sala para dos jugadores. El anfitrión guarda el estado válido: valida cada
+ * acción y la reenvía. Se intenta unir a los navegadores por WebRTC y, si no
+ * hay ruta directa, por el respaldo. El anfitrión escucha siempre por las dos
+ * vías y el invitado se queda con la primera que le responde.
  */
 export class Room {
   seat: Seat;
   state: GameState | null = null;
 
   private peer: PeerType | null = null;
-  private conn: DataConnection | null = null;
+  private conn: Link | null = null;
+  private relay: RelayLink | null = null;
   private session: Session;
   private closed = false;
   private retryTimer = 0;
   private connectTimer = 0;
+  private fallbackTimer = 0;
+  private helloTimer = 0;
+  private resyncTimer = 0;
   /** Desde cuándo fallan los intentos; null si la conexión va bien. */
   private troubleSince: number | null = null;
   private retries = 0;
@@ -128,18 +159,36 @@ export class Room {
     return !!this.conn?.open;
   }
 
+  /** Por el respaldo hay más latencia: conviene enviar menos y esperar más. */
+  get viaRelay(): boolean {
+    return !!this.conn && this.conn === this.relay;
+  }
+
   async start(): Promise<void> {
     this.events.onStatus({ kind: 'connecting' });
     if (this.isHost) {
       this.state = this.session.state ?? createGame(this.session.player);
       this.persist();
       this.events.onState(this.state);
-    } else if (this.session.state) {
-      // Mientras vuelve a conectar, enseña la última partida conocida.
-      this.state = this.session.state;
-      this.events.onState(this.state);
+      void this.startRelay();
+      // Por el respaldo se puede perder algún mensaje durante un corte: repetir
+      // el estado garantiza que el rival nunca se quede congelado.
+      this.resyncTimer = window.setInterval(() => {
+        if (this.viaRelay && this.state) this.sendMessage({ k: 'state', state: this.state });
+      }, RESYNC_EVERY);
+    } else {
+      if (this.session.state) {
+        // Mientras vuelve a conectar, enseña la última partida conocida.
+        this.state = this.session.state;
+        this.events.onState(this.state);
+      }
+      this.fallbackTimer = window.setTimeout(() => {
+        if (this.conn?.open) return;
+        this.events.onStatus({ kind: 'fallback' });
+        void this.startRelay();
+      }, FORCE_RELAY ? 0 : FALLBACK_AFTER);
     }
-    await this.openPeer();
+    if (!FORCE_RELAY) await this.openPeer();
   }
 
   /** Aplica una acción de este jugador. */
@@ -159,7 +208,11 @@ export class Room {
     this.closed = true;
     clearTimeout(this.retryTimer);
     clearTimeout(this.connectTimer);
+    clearTimeout(this.fallbackTimer);
+    clearInterval(this.helloTimer);
+    clearInterval(this.resyncTimer);
     this.conn?.close();
+    this.relay?.close();
     this.peer?.destroy();
   }
 
@@ -169,17 +222,69 @@ export class Room {
     if (this.persistent) saveSession(this.code, this.session);
   }
 
+  // --- Respaldo ---------------------------------------------------------------
+
+  private async startRelay(): Promise<void> {
+    if (this.relay || this.closed) return;
+    const { RelayLink } = await import('./relay');
+    if (this.relay || this.closed) return;
+    const link: RelayLink = new RelayLink(this.code, this.session.role, {
+      onOpen: () => this.onRelayOpen(),
+      onData: (data) => {
+        if (this.isHost) this.onHostData(link, data);
+        else this.onGuestData(link, data);
+      },
+      onPeerLost: () => this.onRelayPeerLost(link),
+    });
+    this.relay = link;
+    await link.connect();
+  }
+
+  private onRelayOpen(): void {
+    if (this.isHost) {
+      // Aunque el servidor de PeerJS no responda, la sala ya se puede compartir.
+      if (!this.conn?.open && !this.state?.players[1]) this.events.onStatus({ kind: 'waiting-peer' });
+      return;
+    }
+    this.startHelloLoop();
+  }
+
+  /** Los mensajes QoS 0 o el anfitrión pueden no estar aún: se repite hasta que conteste. */
+  private startHelloLoop(): void {
+    const relay = this.relay;
+    if (!relay || this.conn?.open) return;
+    clearInterval(this.helloTimer);
+    const hello = () => {
+      if (this.conn?.open || !relay.open) return;
+      relay.send({ k: 'hello', token: this.session.token, player: this.session.player });
+    };
+    hello();
+    this.helloTimer = window.setInterval(hello, HELLO_EVERY);
+  }
+
+  private onRelayPeerLost(link: RelayLink): void {
+    if (this.conn !== link) return;
+    this.conn = null;
+    this.events.onStatus({ kind: 'reconnecting' });
+    if (!this.isHost) this.startHelloLoop();
+  }
+
+  // --- WebRTC -----------------------------------------------------------------
+
   private async openPeer(): Promise<void> {
     if (this.closed) return;
     const { Peer } = await import('peerjs');
+    if (this.closed) return;
     this.peer?.destroy();
-    const peer = this.isHost ? new Peer(PREFIX + this.code) : new Peer();
+    const options = { config: { iceServers: ICE_SERVERS } };
+    const peer = this.isHost ? new Peer(PREFIX + this.code, options) : new Peer(options);
     this.peer = peer;
 
     peer.on('open', () => {
       this.retries = 0;
       if (this.isHost) {
         this.troubleSince = null;
+        if (this.conn?.open) return;
         const hasGuest = this.state?.players[1];
         this.events.onStatus(hasGuest ? { kind: 'reconnecting' } : { kind: 'waiting-peer' });
       } else {
@@ -214,10 +319,8 @@ export class Room {
           break;
         case 'browser-incompatible':
         case 'webrtc':
-          this.events.onStatus({
-            kind: 'failed',
-            message: 'Este navegador o esta red no permiten la conexión directa (WebRTC).',
-          });
+          // Sin WebRTC todavía queda el respaldo.
+          void this.startRelay();
           break;
         default:
           console.warn('[sala]', err.type, err.message);
@@ -230,7 +333,9 @@ export class Room {
     if (this.giveUpIfTooLong()) return;
     this.retries++;
     const wait = Math.min(1000 * 2 ** Math.min(this.retries, 3), 8000);
-    this.events.onStatus({ kind: this.state?.players[1] ? 'reconnecting' : 'connecting' });
+    if (!this.conn?.open && !this.relay?.open) {
+      this.events.onStatus({ kind: this.state?.players[1] ? 'reconnecting' : 'connecting' });
+    }
     this.retryTimer = window.setTimeout(() => void this.openPeer(), wait);
   }
 
@@ -238,7 +343,7 @@ export class Room {
     clearTimeout(this.retryTimer);
     clearTimeout(this.connectTimer);
     if (this.giveUpIfTooLong()) return;
-    this.events.onStatus({ kind: this.state ? 'reconnecting' : 'connecting' });
+    if (!this.relay) this.events.onStatus({ kind: this.state ? 'reconnecting' : 'connecting' });
     this.retryTimer = window.setTimeout(() => this.connectToHost(), 2500);
   }
 
@@ -250,7 +355,7 @@ export class Room {
       kind: 'failed',
       message: this.isHost
         ? 'No se puede abrir la sala. Comprueba tu conexión a internet y vuelve a intentarlo.'
-        : 'No se encuentra la sala. Asegúrate de que quien la creó sigue con la página abierta, o prueba con otra red.',
+        : 'No se encuentra la sala. Asegúrate de que quien la creó sigue con la página abierta, o recarga para volver a intentarlo.',
     });
     return true;
   }
@@ -268,14 +373,15 @@ export class Room {
 
     conn.on('open', () => {
       clearTimeout(this.connectTimer);
-      this.conn = conn;
-      this.troubleSince = null;
       this.send(conn, { k: 'hello', token: this.session.token, player: this.session.player });
     });
-    conn.on('data', (data) => this.onGuestData(data));
+    conn.on('data', (data) => this.onGuestData(conn, data));
     conn.on('close', () => {
-      if (this.conn === conn) this.conn = null;
-      if (!this.closed) this.retryConnect();
+      if (this.conn === conn) {
+        this.conn = null;
+        void this.startRelay();
+      }
+      if (!this.closed && !this.viaRelay) this.retryConnect();
     });
     conn.on('error', () => {
       if (this.conn !== conn) return;
@@ -284,23 +390,30 @@ export class Room {
     });
   }
 
-  private onGuestData(data: unknown): void {
+  // --- Mensajes ---------------------------------------------------------------
+
+  private onGuestData(link: Link, data: unknown): void {
     const frame = decodeFrame(data);
     if (frame) {
-      this.events.onFrame(frame.time, frame.poses);
+      if (link === this.conn) this.events.onFrame(frame.time, frame.poses);
       return;
     }
     const msg = data as NetMessage;
     switch (msg?.k) {
       case 'welcome':
-        this.events.onStatus({ kind: 'connected' });
-        this.sendMessage({ k: 'ready' });
+        if (msg.to === this.session.token) this.onWelcome(link);
         break;
       case 'full':
+        if (msg.to !== this.session.token) break;
         this.closed = true;
+        clearTimeout(this.fallbackTimer);
+        clearInterval(this.helloTimer);
         this.events.onStatus({ kind: 'failed', message: 'Esta sala ya tiene dos jugadores.' });
         break;
       case 'state':
+        if (link !== this.conn) break;
+        // Por el respaldo el estado se repite periódicamente: si no cambia, no hay nada que hacer.
+        if (JSON.stringify(msg.state) === JSON.stringify(this.state)) break;
         this.state = msg.state;
         this.persist();
         this.events.onState(msg.state);
@@ -308,26 +421,28 @@ export class Room {
     }
   }
 
+  /** La primera vía que contesta se queda; la otra se cierra para no gastar recursos. */
+  private onWelcome(link: Link): void {
+    if (this.conn?.open && this.conn !== link) return;
+    this.conn = link;
+    this.troubleSince = null;
+    clearInterval(this.helloTimer);
+    clearTimeout(this.retryTimer);
+    clearTimeout(this.connectTimer);
+    clearTimeout(this.fallbackTimer);
+    if (link === this.relay) {
+      this.peer?.destroy();
+      this.peer = null;
+    } else {
+      this.relay?.close();
+      this.relay = null;
+    }
+    this.events.onStatus({ kind: 'connected' });
+    this.sendMessage({ k: 'ready' });
+  }
+
   private acceptGuest(conn: DataConnection): void {
-    conn.on('data', (data) => {
-      const frame = decodeFrame(data);
-      if (frame) {
-        if (conn === this.conn) this.events.onFrame(frame.time, frame.poses);
-        return;
-      }
-      const msg = data as NetMessage;
-      switch (msg?.k) {
-        case 'hello':
-          this.onHello(conn, msg.token, msg.player);
-          break;
-        case 'action':
-          if (conn === this.conn) this.applyAsHost(1, msg.action);
-          break;
-        case 'ready':
-          if (conn === this.conn) this.events.onPeerReady();
-          break;
-      }
-    });
+    conn.on('data', (data) => this.onHostData(conn, data));
     conn.on('close', () => {
       if (conn !== this.conn) return;
       this.conn = null;
@@ -335,12 +450,32 @@ export class Room {
     });
   }
 
-  private onHello(conn: DataConnection, token: string, player: Player): void {
+  private onHostData(link: Link, data: unknown): void {
+    const frame = decodeFrame(data);
+    if (frame) {
+      if (link === this.conn) this.events.onFrame(frame.time, frame.poses);
+      return;
+    }
+    const msg = data as NetMessage;
+    switch (msg?.k) {
+      case 'hello':
+        this.onHello(link, msg.token, msg.player);
+        break;
+      case 'action':
+        if (link === this.conn) this.applyAsHost(1, msg.action);
+        break;
+      case 'ready':
+        if (link === this.conn) this.events.onPeerReady();
+        break;
+    }
+  }
+
+  private onHello(link: Link, token: string, player: Player): void {
     if (!this.state) return;
     const known = this.session.guestToken;
     if (known && known !== token) {
-      this.send(conn, { k: 'full' });
-      setTimeout(() => conn.close(), 300);
+      this.send(link, { k: 'full', to: token });
+      if (link !== this.relay) setTimeout(() => link.close(), 300);
       return;
     }
     if (!known) {
@@ -348,11 +483,12 @@ export class Room {
       const joined = reduce(this.state, 1, { type: 'join', player });
       if (joined) this.state = joined;
     }
-    if (this.conn && this.conn !== conn) this.conn.close();
-    this.conn = conn;
+    // El respaldo es compartido: al cambiar de vía no se desconecta del servidor.
+    if (this.conn && this.conn !== link && this.conn !== this.relay) this.conn.close();
+    this.conn = link;
     this.persist();
-    this.send(conn, { k: 'welcome', seat: 1 });
-    this.send(conn, { k: 'state', state: this.state });
+    this.send(link, { k: 'welcome', seat: 1, to: token });
+    this.send(link, { k: 'state', state: this.state });
     this.events.onStatus({ kind: 'connected' });
     this.events.onState(this.state);
   }
@@ -375,7 +511,7 @@ export class Room {
     if (this.conn?.open) this.send(this.conn, msg);
   }
 
-  private send(conn: DataConnection, msg: NetMessage): void {
-    conn.send(msg);
+  private send(link: Link, msg: NetMessage): void {
+    link.send(msg);
   }
 }

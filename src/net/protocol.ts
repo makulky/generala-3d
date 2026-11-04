@@ -3,11 +3,12 @@ import { POSE_FLOATS } from '../physics/constants';
 
 export type NetMessage =
   | { k: 'hello'; token: string; player: Player }
-  | { k: 'welcome'; seat: Seat }
-  | { k: 'full' }
+  | { k: 'welcome'; seat: Seat; to: string }
+  | { k: 'full'; to: string }
   | { k: 'state'; state: GameState }
   | { k: 'action'; action: Action }
-  | { k: 'ready' };
+  | { k: 'ready' }
+  | { k: 'ping' };
 
 /** Paquete binario de poses: marca de tiempo (ms) + poses. */
 export const FRAME_FLOATS = POSE_FLOATS + 1;

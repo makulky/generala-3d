@@ -78,6 +78,9 @@ export class Hud {
       case 'connecting':
         html = 'Conectando…';
         break;
+      case 'fallback':
+        html = 'La conexión directa no funciona. Probando otra vía…';
+        break;
       case 'reconnecting':
         html = s?.players[1] ? 'Se ha perdido la conexión. Reconectando…' : 'Conectando…';
         cls = 'warn';

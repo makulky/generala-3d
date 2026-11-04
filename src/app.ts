@@ -10,6 +10,9 @@ import { Scorecard } from './ui/scorecard';
 
 const FRAME_INTERVAL = 1000 / 30;
 const PLAYBACK_DELAY = 90;
+/** Por el servidor de respaldo: menos paquetes y más margen para los retrasos. */
+const RELAY_FRAME_INTERVAL = 1000 / 15;
+const RELAY_PLAYBACK_DELAY = 260;
 const GRAB_PLANE_Y = 3;
 
 interface BufferedFrame {
@@ -70,7 +73,7 @@ export function startGame(o: GameOptions): void {
         table.step(dt);
         table.poses(display);
         scene.applyPoses(display);
-        if (now - lastSent >= FRAME_INTERVAL) sendSnapshot(now);
+        if (now - lastSent >= (room.viaRelay ? RELAY_FRAME_INTERVAL : FRAME_INTERVAL)) sendSnapshot(now);
         sentActive = true;
         return true;
       }
@@ -86,7 +89,7 @@ export function startGame(o: GameOptions): void {
 
   function playBuffered(now: number): boolean {
     if (frames.length === 0 || clockOffset === null) return false;
-    const t = now - clockOffset - PLAYBACK_DELAY;
+    const t = now - clockOffset - (room.viaRelay ? RELAY_PLAYBACK_DELAY : PLAYBACK_DELAY);
     while (frames.length > 1 && frames[1].time <= t) frames.shift();
     const a = frames[0];
     const b = frames[1];
@@ -151,10 +154,19 @@ export function startGame(o: GameOptions): void {
     },
   });
 
+  let lastRoll: number[] | null = null;
   table.onSettled = (values) => {
     awaitingRollEnd = true;
+    lastRoll = values;
     room.dispatch({ type: 'rollEnd', values });
   };
+
+  // Si se pierde el aviso de fin de tirada, la partida no debe quedarse esperando.
+  setInterval(() => {
+    if (awaitingRollEnd && lastRoll && state?.rolling && isOwner() && room.connected) {
+      room.dispatch({ type: 'rollEnd', values: lastRoll });
+    }
+  }, 2000);
 
   const scorecard = new Scorecard(o.card, (category: Category) => {
     room.dispatch({ type: 'score', category });

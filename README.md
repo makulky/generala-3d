@@ -5,7 +5,7 @@ Juego de la Generala para dos jugadores en el navegador, con cubilete y dados en
 ## Características
 
 - **Física real:** agitas el cubilete, los dados chocan dentro y el resultado es la cara que queda hacia arriba en la simulación.
-- **Multijugador directo:** los navegadores se conectan por WebRTC y cada jugador ve en vivo la tirada del otro.
+- **Multijugador en vivo:** los navegadores se conectan por WebRTC y, si la red no lo permite, pasan solos a un servidor de respaldo. Cada jugador ve la tirada del otro.
 - **Reconexión:** la partida se guarda en el navegador, así que se puede recargar la página y seguir jugando.
 - **Sitio estático:** no necesita un backend propio y se despliega en Vercel tal cual.
 - **Gráficos procedurales:** la mesa, la bandeja, el cubilete y los dados se generan por código, sin imágenes ni modelos que descargar.
@@ -69,7 +69,8 @@ npx vercel --prod
 
 - **Render:** [Three.js](https://threejs.org/).
 - **Física:** [cannon-es](https://github.com/pmndrs/cannon-es), con paso fijo de 1/120 s.
-- **Red:** [PeerJS](https://peerjs.com/) sobre WebRTC.
+- **Red:** [PeerJS](https://peerjs.com/) sobre WebRTC. Si en unos 7 segundos no hay conexión directa, se usa [MQTT](https://github.com/mqttjs/MQTT.js) con un servidor público.
+- **Cifrado del respaldo:** los mensajes viajan con AES-GCM y una clave derivada del código de sala, que forma parte del enlace y nunca se envía al servidor.
 - **Autoridad:** el navegador de quien crea la sala valida cada acción y reenvía el estado.
 - **Tiradas en vivo:** las simula quien tira y envía las posiciones a unos 30 Hz; el rival las interpola, de modo que ambos ven la misma tirada.
 
@@ -87,7 +88,7 @@ src/
 ## Limitaciones
 
 - **Solo dos jugadores:** no hay espectadores ni cuentas de usuario.
-- **Conexión:** la señalización usa el servidor público gratuito de PeerJS. Si no está disponible, no se pueden abrir salas nuevas, y algunas redes estrictas pueden bloquear WebRTC.
+- **Conexión:** depende de servicios públicos gratuitos y sin garantías: el servidor de PeerJS para la conexión directa y `broker.emqx.io` para el respaldo. Por el respaldo, el movimiento de los dados del rival es menos fluido y va con algo más de retraso.
 - **Sin protección contra trampas:** quien tira informa de sus propios dados, y recargar en plena tirada permite repetirla. Está pensado para jugar entre amigos.
 - **Quien crea la sala debe seguir conectado:** la partida se detiene si cierra la página hasta que vuelva a abrirla en el mismo navegador.
 - **Sin sonido.**
