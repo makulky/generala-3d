@@ -1,9 +1,9 @@
 import * as CANNON from 'cannon-es';
 import {
   CUP_FLOOR,
-  CUP_HEIGHT,
   CUP_INNER_R,
   CUP_OUTER_R,
+  CUP_RIM_TOP,
   DIE_SIZE,
   FELT,
 } from './constants';
@@ -31,7 +31,15 @@ export function createPhysics(): Physics {
   const mCup = new CANNON.Material('cup');
   world.addContactMaterial(new CANNON.ContactMaterial(mDie, mFelt, { friction: 0.55, restitution: 0.32 }));
   world.addContactMaterial(new CANNON.ContactMaterial(mDie, mWall, { friction: 0.12, restitution: 0.5 }));
-  world.addContactMaterial(new CANNON.ContactMaterial(mDie, mCup, { friction: 0.08, restitution: 0.3 }));
+  // Contacto más rígido: los dados chocan rápido contra un cubilete que también se mueve.
+  world.addContactMaterial(
+    new CANNON.ContactMaterial(mDie, mCup, {
+      friction: 0.08,
+      restitution: 0.3,
+      contactEquationStiffness: 5e8,
+      contactEquationRelaxation: 3,
+    }),
+  );
   world.addContactMaterial(new CANNON.ContactMaterial(mDie, mDie, { friction: 0.15, restitution: 0.4 }));
 
   const floor = new CANNON.Body({
@@ -100,12 +108,12 @@ export function createPhysics(): Physics {
   const wallThick = CUP_OUTER_R - CUP_INNER_R;
   const wallR = CUP_INNER_R + wallThick / 2;
   const segWidth = 2 * CUP_OUTER_R * Math.tan(Math.PI / segments) + 0.1;
-  const seg = new CANNON.Box(new CANNON.Vec3(wallThick / 2, CUP_HEIGHT / 2, segWidth / 2));
+  const seg = new CANNON.Box(new CANNON.Vec3(wallThick / 2, CUP_RIM_TOP / 2, segWidth / 2));
   for (let i = 0; i < segments; i++) {
     const a = (i / segments) * Math.PI * 2;
     const q = new CANNON.Quaternion();
     q.setFromEuler(0, -a, 0);
-    cup.addShape(seg, new CANNON.Vec3(Math.cos(a) * wallR, CUP_HEIGHT / 2, Math.sin(a) * wallR), q);
+    cup.addShape(seg, new CANNON.Vec3(Math.cos(a) * wallR, CUP_RIM_TOP / 2, Math.sin(a) * wallR), q);
   }
   const base = new CANNON.Box(new CANNON.Vec3(1.8, CUP_FLOOR, 1.8));
   const baseQ = new CANNON.Quaternion();

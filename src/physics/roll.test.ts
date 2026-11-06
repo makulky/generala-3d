@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as CANNON from 'cannon-es';
-import { CUP_ASIDE, CUP_HEIGHT, CUP_INNER_R, CUP_LANE_X, CUP_OUTER_R, FELT } from './constants';
+import { CUP_ASIDE, CUP_HEIGHT, CUP_INNER_R, CUP_LANE_X, CUP_OUTER_R, CUP_RIM_TOP, FELT } from './constants';
 import { DiceTable, quatForValue, readFace } from './roll';
 
 declare const process: { env: Record<string, string | undefined> };
@@ -124,6 +124,95 @@ describe('movimiento del cubilete', () => {
   });
 });
 
+/** Cuánto entra una esquina del dado en el sólido del cubilete. */
+function cupPenetration(table: DiceTable, b: CANNON.Body): number {
+  let worst = 0;
+  for (const sx of [-0.5, 0.5]) for (const sy of [-0.5, 0.5]) for (const sz of [-0.5, 0.5]) {
+    const l = table.phys.cup.pointToLocalFrame(b.pointToWorldFrame(new CANNON.Vec3(sx, sy, sz)));
+    const r = Math.hypot(l.x, l.z);
+    if (l.y > 0 && l.y < CUP_RIM_TOP && r > CUP_INNER_R && r < CUP_OUTER_R) {
+      worst = Math.max(worst, Math.min(r - CUP_INNER_R, CUP_OUTER_R - r, CUP_RIM_TOP - l.y));
+    }
+  }
+  return worst;
+}
+
+describe('los dados y el cubilete no se atraviesan', () => {
+  it('el cubilete no se retira con dados dentro ni los arrastra', () => {
+    const table = new DiceTable();
+    const rolls = 60;
+    let deep = 0;
+    for (let n = 0; n < rolls; n++) {
+      let done = false;
+      table.onSettled = () => {
+        done = true;
+      };
+      table.beginRoll(false);
+      let worst = 0;
+      for (let t = 0; t < 30 && !done; t += FIXED) {
+        table.step(FIXED);
+        for (const b of table.phys.dice) worst = Math.max(worst, cupPenetration(table, b));
+      }
+      expect(done).toBe(true);
+      if (worst > 0.25) deep++;
+    }
+    expect(table.stats.stuck).toBe(0);
+    // Antes del arreglo ocurría en el 95 % de las tiradas.
+    expect(deep / rolls).toBeLessThan(0.05);
+  }, 120_000);
+
+  it('las caras no cambian después de dar la tirada por terminada', () => {
+    const table = new DiceTable();
+    for (let n = 0; n < 25; n++) {
+      const values = rollUntilSettled(table)!;
+      for (let t = 0; t < 1.5; t += FIXED) table.step(FIXED);
+      expect(table.phys.dice.map((b) => readFace(b.quaternion).value)).toEqual(values);
+    }
+  }, 60_000);
+});
+
+describe('la mesa siempre muestra lo que dice el estado', () => {
+  const NONE = [false, false, false, false, false];
+
+  it('detecta y corrige una cara distinta', () => {
+    const table = new DiceTable();
+    const values = rollUntilSettled(table)!;
+    for (let t = 0; t < 1; t += FIXED) table.step(FIXED);
+    expect(table.matches(values, NONE)).toBe(true);
+
+    // El estado dice otra cosa: es lo que pasaba con los dos 5 y el 3.
+    const state = [...values];
+    state[1] = (values[1] % 6) + 1;
+    expect(table.matches(state, NONE)).toBe(false);
+    table.reconcile(state, NONE);
+    runUntil(table, () => !table.isActive());
+    expect(table.matches(state, NONE)).toBe(true);
+    expect(table.dice[1].value).toBe(state[1]);
+  });
+
+  it('corrige también qué dados están guardados', () => {
+    const table = new DiceTable();
+    const values = rollUntilSettled(table)!;
+    for (let t = 0; t < 1; t += FIXED) table.step(FIXED);
+    const held = [false, true, false, false, true];
+    table.reconcile(values, held);
+    runUntil(table, () => !table.isActive());
+    expect(table.heldMask()).toEqual(held);
+    expect(table.matches(values, held)).toBe(true);
+  });
+
+  it('guardar en la mesa y tirar respeta el dado guardado al instante', () => {
+    const table = new DiceTable();
+    const first = rollUntilSettled(table)!;
+    for (let t = 0; t < 1; t += FIXED) table.step(FIXED);
+    // Sin simular nada entre medias, como un clic seguido de "Tirar".
+    table.setHeld(0, true);
+    const second = rollUntilSettled(table)!;
+    expect(second[0]).toBe(first[0]);
+    expect(table.heldMask()[0]).toBe(true);
+  });
+});
+
 describe('dados', () => {
   it('lee correctamente cada cara colocada hacia arriba', () => {
     for (let v = 1; v <= 6; v++) {
@@ -163,7 +252,7 @@ describe(`simulación de ${ROLLS} tiradas`, () => {
       const chi2 = faces.slice(1).reduce((acc, f) => acc + (f - expected) ** 2 / expected, 0);
       console.log(
         `caras=${faces.slice(1).join(',')} chi2=${chi2.toFixed(2)} ` +
-          `recuperados=${table.stats.recovered} empujones=${table.stats.nudged} forzados=${table.stats.forced} reintentos=${table.stats.rehops}`,
+          `recuperados=${table.stats.recovered} empujones=${table.stats.nudged} forzados=${table.stats.forced} reintentos=${table.stats.rehops} atascados=${table.stats.stuck}`,
       );
       // Con 5 grados de libertad, 20.5 corresponde a p≈0.001.
       if (ROLLS >= 400) expect(chi2).toBeLessThan(20.5);

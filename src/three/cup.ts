@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CUP_FLOOR, CUP_HEIGHT, CUP_INNER_R, CUP_OUTER_R } from '../physics/constants';
+import { CUP_FLOOR, CUP_HEIGHT, CUP_INNER_R, CUP_OUTER_R, CUP_RIM_TUBE } from '../physics/constants';
 import { feltTextures, knurlTexture } from './textures';
 
 /** El origen del grupo coincide con el del cuerpo físico: centro del fondo. */
@@ -78,7 +78,7 @@ export function createCup(): THREE.Group {
   knurl.repeat.set(70, 4);
   const rimRadius = (CUP_INNER_R + CUP_OUTER_R) / 2;
   const rim = new THREE.Mesh(
-    new THREE.TorusGeometry(rimRadius, (CUP_OUTER_R - CUP_INNER_R) / 2 + 0.02, 18, 96),
+    new THREE.TorusGeometry(rimRadius, CUP_RIM_TUBE, 18, 96),
     new THREE.MeshStandardMaterial({
       color: 0x47484a,
       roughness: 0.92,

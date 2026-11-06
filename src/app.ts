@@ -3,7 +3,7 @@ import type { Category } from './game/rules';
 import { encodeFrame } from './net/protocol';
 import { Room, type RoomStatus } from './net/room';
 import { CUP_ASIDE, CUP_READY, CUP_HEIGHT, POSE_FLOATS } from './physics/constants';
-import { DiceTable } from './physics/roll';
+import { DiceTable, readFaceFromPoses } from './physics/roll';
 import { Scene3D } from './three/scene';
 import { Hud } from './ui/hud';
 import { Scorecard } from './ui/scorecard';
@@ -14,6 +14,8 @@ const PLAYBACK_DELAY = 90;
 const RELAY_FRAME_INTERVAL = 1000 / 15;
 const RELAY_PLAYBACK_DELAY = 260;
 const GRAB_PLANE_Y = 3;
+const SYNC_EVERY = 2000;
+const MAX_ROLL_RETRIES = 15;
 
 interface BufferedFrame {
   time: number;
@@ -41,7 +43,10 @@ export function startGame(o: GameOptions): void {
   let state: GameState | null = null;
   let status: RoomStatus = { kind: 'connecting' };
   let wasOwner = false;
-  let awaitingRollEnd = false;
+  /** Tirada de este jugador que el anfitrión aún no ha confirmado. */
+  let pending: { id: number; held: boolean[]; values: number[] | null; tries: number } | null = null;
+  let mismatchChecks = 0;
+  let lastFrameAt = 0;
   let dragging = false;
   let grabX = 0;
   let grabZ = 0;
@@ -130,6 +135,7 @@ export function startGame(o: GameOptions): void {
     onFrame(time, poses) {
       if (isOwner()) return;
       const now = performance.now();
+      lastFrameAt = now;
       const last = frames[frames.length - 1];
       if (last && time < last.time - 1000) {
         // Se ha reiniciado el reloj del otro jugador.
@@ -145,7 +151,6 @@ export function startGame(o: GameOptions): void {
     },
     onStatus(next) {
       status = next;
-      if (next.kind === 'connected') awaitingRollEnd = false;
       hud.setStatus(next);
       refreshUi();
     },
@@ -154,19 +159,56 @@ export function startGame(o: GameOptions): void {
     },
   });
 
-  let lastRoll: number[] | null = null;
   table.onSettled = (values) => {
-    awaitingRollEnd = true;
-    lastRoll = values;
-    room.dispatch({ type: 'rollEnd', values });
+    if (!pending) return;
+    pending.values = values;
+    room.dispatch({ type: 'rollEnd', id: pending.id, values });
   };
 
-  // Si se pierde el aviso de fin de tirada, la partida no debe quedarse esperando.
-  setInterval(() => {
-    if (awaitingRollEnd && lastRoll && state?.rolling && isOwner() && room.connected) {
-      room.dispatch({ type: 'rollEnd', values: lastRoll });
+  /** Comprueba que lo que se ve es lo que cuenta y corrige si alguna vez no lo es. */
+  function checkInSync(): void {
+    const s = state;
+    if (!s || s.phase === 'lobby' || s.rolling || pending || s.rollsUsed === 0) {
+      mismatchChecks = 0;
+      return;
     }
-  }, 2000);
+    const owner = isOwner();
+    if (owner && (table.phase !== 'idle' || table.isActive())) return;
+    if (!owner && performance.now() - lastFrameAt < 1500) return;
+    const fine = owner
+      ? table.matches(s.dice, s.held)
+      : s.dice.every((v, i) => readFaceFromPoses(display, i).value === v);
+    if (fine) {
+      mismatchChecks = 0;
+      return;
+    }
+    // Una sola comprobación puede ser un mensaje que aún viene de camino.
+    if (++mismatchChecks < 2) return;
+    mismatchChecks = 0;
+    console.warn('[partida] la mesa no coincidía con el estado; corregida');
+    if (owner) {
+      table.reconcile(s.dice, s.held);
+    } else {
+      restoreTable(s);
+      scene.render();
+    }
+    wake();
+  }
+
+  setInterval(() => {
+    // Si se pierde el inicio o el fin de una tirada, se repiten: con el mismo
+    // identificador no cuentan doble y la tirada caída se conserva.
+    if (pending?.values && isOwner() && room.connected) {
+      if (++pending.tries > MAX_ROLL_RETRIES) {
+        pending = null;
+      } else {
+        room.dispatch({ type: 'rollStart', id: pending.id, held: pending.held });
+        room.dispatch({ type: 'rollEnd', id: pending.id, values: pending.values });
+      }
+    }
+    checkInSync();
+    if (isOwner() && room.viaRelay && !table.isActive()) sendSnapshot();
+  }, SYNC_EVERY);
 
   const scorecard = new Scorecard(o.card, (category: Category) => {
     room.dispatch({ type: 'score', category });
@@ -184,8 +226,8 @@ export function startGame(o: GameOptions): void {
   function applyState(next: GameState): void {
     const prev = state;
     state = next;
-    if (!next.rolling) awaitingRollEnd = false;
     const owner = isOwner();
+    if (pending && (!owner || (next.rollId === pending.id && !next.rolling))) pending = null;
 
     if (firstState) {
       firstState = false;
@@ -196,14 +238,12 @@ export function startGame(o: GameOptions): void {
       clockOffset = null;
       table.adopt(display);
       table.gatherAll();
-    } else if (owner && table.phase === 'idle') {
-      next.held.forEach((h, i) => table.setHeld(i, h));
     }
     wasOwner = owner;
 
-    // Una tirada interrumpida por una recarga o un corte se puede repetir.
-    if (owner && next.rolling && table.phase === 'idle' && !awaitingRollEnd) {
-      room.dispatch({ type: 'rollAbort' });
+    // Solo una recarga en plena tirada la deja sin resultado: se puede repetir.
+    if (owner && next.rolling && table.phase === 'idle' && !pending) {
+      room.dispatch({ type: 'rollAbort', id: next.rollId });
     }
 
     if (owner && room.connected && !table.isActive()) sendSnapshot();
@@ -236,18 +276,25 @@ export function startGame(o: GameOptions): void {
 
   // --- Interacción ----------------------------------------------------------
   function startRoll(manual: boolean): boolean {
-    if (!state || !canAct() || !canRoll(state) || !table.canBeginRoll()) return false;
+    if (!state || !canAct() || pending || !table.canBeginRoll()) return false;
+    // Los guardados son los de la mesa, aunque su confirmación siga de camino.
+    const held = table.heldMask();
+    if (!canRoll({ ...state, held })) return false;
+    pending = { id: Date.now(), held, values: null, tries: 0 };
     // La mesa arranca antes: el anfitrión aplica la acción de forma síncrona y,
     // si la viera parada, creería que es una tirada interrumpida.
     table.beginRoll(manual);
-    room.dispatch({ type: 'rollStart' });
+    room.dispatch({ type: 'rollStart', id: pending.id, held });
     wake();
     return true;
   }
 
   function toggleHold(i: number): void {
-    if (!state || !canAct() || !canHold(state) || table.phase !== 'idle') return;
-    room.dispatch({ type: 'hold', index: i });
+    if (!state || !canAct() || !canHold(state) || pending || table.phase !== 'idle') return;
+    // Se mueve al instante: mientras dure el turno, la mesa de este jugador manda.
+    const held = !table.dice[i].held;
+    table.setHeld(i, held);
+    room.dispatch({ type: 'hold', index: i, held });
     wake();
   }
 
@@ -317,7 +364,16 @@ export function startGame(o: GameOptions): void {
   });
 
   if (import.meta.env.DEV) {
-    Object.assign(window, { __generala: { room, table, startRoll, getState: () => state } });
+    Object.assign(window, {
+      __generala: {
+        room,
+        table,
+        startRoll,
+        toggleHold,
+        getState: () => state,
+        shownFaces: () => [0, 1, 2, 3, 4].map((i) => readFaceFromPoses(display, i).value),
+      },
+    });
   }
 
   void room.start();

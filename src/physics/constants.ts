@@ -17,6 +17,9 @@ export const CUP_INNER_R = 2.3;
 export const CUP_OUTER_R = 2.9;
 export const CUP_HEIGHT = 4.3;
 export const CUP_FLOOR = 0.3;
+/** Altura del aro del borde: la pared física llega hasta aquí para que nada lo cruce. */
+export const CUP_RIM_TUBE = (CUP_OUTER_R - CUP_INNER_R) / 2;
+export const CUP_RIM_TOP = CUP_HEIGHT + CUP_RIM_TUBE;
 
 /** Sobre la bandeja, listo para tirar, como en el diseño. */
 export const CUP_READY = { x: 4.5, y: 1.2, z: -0.2 };

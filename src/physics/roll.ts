@@ -9,6 +9,7 @@ import {
   CUP_POUR,
   CUP_POUR_ANGLE,
   CUP_READY,
+  CUP_RIM_TOP,
   FACE_NORMALS,
   FELT,
   POSE_FLOATS,
@@ -29,9 +30,18 @@ const AUTO_SHAKE_TIME = 0.95;
 const MIN_SHAKE_TIME = 0.35;
 const WINDUP_TIME = 0.22;
 const WINDUP_SPEED = 22;
-const THROW_TIME = 0.34;
-const MAX_POUR_HOLD = 1.8;
-const SETTLE_NUDGE_TIME = 3.5;
+const THROW_TIME = 0.5;
+const MAX_POUR_HOLD = 3;
+const STUCK_EXTRA_TILT = 0.4;
+const STUCK_EJECT_AFTER = 1;
+const SETTLE_NUDGE_TIME = 2;
+const SETTLE_FORCE_TIME = 7;
+/** Tiempo que un dado debe seguir quieto para contar como parado. */
+const REST_STILL = 0.12;
+/** Pasado este tiempo, un dado plano que apenas vibra ya cuenta como parado. */
+const JITTER_SPEED = 0.8;
+/** Tras volcar, el cubilete se aleja de los dados antes de enderezarse. */
+const RETREAT_TIME = 0.3;
 const FLAT_DOT = 0.985;
 const STILL_BEFORE_NUDGE = 0.35;
 
@@ -113,6 +123,12 @@ export function readFace(q: CANNON.Quaternion): { value: number; dot: number } {
   return { value, dot };
 }
 
+/** Cara hacia arriba del dado `i` en un paquete de poses. */
+export function readFaceFromPoses(poses: Float32Array, i: number): { value: number; dot: number } {
+  const o = 7 + i * 7;
+  return readFace(new CANNON.Quaternion(poses[o + 3], poses[o + 4], poses[o + 5], poses[o + 6]));
+}
+
 function randomQuat(): CANNON.Quaternion {
   const q = new CANNON.Quaternion(
     Math.random() - 0.5,
@@ -135,7 +151,7 @@ export class DiceTable {
   phase: Phase = 'idle';
   onSettled: ((values: number[]) => void) | null = null;
   /** Estadísticas para las pruebas de simulación. */
-  stats = { recovered: 0, nudged: 0, forced: 0, rehops: 0 };
+  stats = { recovered: 0, nudged: 0, forced: 0, rehops: 0, reconciled: 0, stuck: 0 };
 
   private acc = 0;
   private phaseT = 0;
@@ -308,6 +324,54 @@ export class DiceTable {
     }
   }
 
+  heldMask(): boolean[] {
+    return this.dice.map((d) => d.held);
+  }
+
+  /** ¿Lo que muestra la mesa coincide con estos valores y dados guardados? */
+  matches(values: number[], held: boolean[]): boolean {
+    return this.dice.every((die, i) => {
+      if (die.tween || die.held !== held[i] || die.state === 'parked') return false;
+      return readFace(this.phys.dice[i].quaternion).value === values[i];
+    });
+  }
+
+  /**
+   * Corrige la mesa para que muestre exactamente lo que dice el estado de la
+   * partida, que es lo que puntúa. No debería hacer falta nunca: es la red de
+   * seguridad por si algo se pierde por el camino.
+   */
+  reconcile(values: number[], held: boolean[]): void {
+    if (this.phase !== 'idle') return;
+    this.stats.reconciled++;
+    this.dice.forEach((die, i) => {
+      if (die.tween) return;
+      const body = this.phys.dice[i];
+      const wrongFace = readFace(body.quaternion).value !== values[i];
+      const parked = die.state === 'parked';
+      die.value = values[i];
+      if (die.held !== held[i]) {
+        this.setHeld(i, held[i]);
+        return;
+      }
+      if (!wrongFace && !parked) return;
+      this.freeze(i);
+      if (held[i]) {
+        const slot = new CANNON.Vec3(SLOT_X[die.slot], SLOT_FLOOR_Y + 0.5, SLOT_Z);
+        this.startTween(i, slot, quatForValue(values[i]), 0.3, 1, () => {
+          die.state = 'held';
+        });
+      } else {
+        const spot = this.freeSpot(i);
+        this.startTween(i, spot, quatForValue(values[i], Math.random() * Math.PI), 0.3, 1, () => {
+          this.toResting(i, spot, body.quaternion);
+        });
+      }
+    });
+    this.cupTargetPos.set(CUP_ASIDE.x, CUP_ASIDE.y, CUP_ASIDE.z);
+    this.cupTargetQ.set(0, 0, 0, 1);
+  }
+
   /** ¿Hay algo moviéndose que obligue a seguir simulando y enviando poses? */
   isActive(): boolean {
     if (this.phase !== 'idle') return true;
@@ -348,8 +412,12 @@ export class DiceTable {
     this.updateHops();
     this.updatePhase();
     this.driveCup();
-    this.phys.world.step(DT);
-    this.clampDice();
+    // Mientras el cubilete se mueve rápido, la física va más fina para que nada lo atraviese.
+    const substeps = this.phase === 'shake' || this.phase === 'pour' ? 2 : 1;
+    for (let s = 0; s < substeps; s++) {
+      this.phys.world.step(DT / substeps);
+      this.clampDice();
+    }
   }
 
   private startGather(): void {
@@ -399,7 +467,7 @@ export class DiceTable {
   /** El dado sube en vertical, cruza por encima del borde y cae dentro con física. */
   private updateHops(): void {
     const cup = this.phys.cup.position;
-    const top = cup.y + CUP_HEIGHT + 1.1;
+    const top = cup.y + CUP_RIM_TOP + 1;
     this.phys.dice.forEach((body, i) => {
       const die = this.dice[i];
       const hop = die.hop;
@@ -476,7 +544,7 @@ export class DiceTable {
       const die = this.dice[i];
       if (die.hop || die.state !== 'free') continue;
       const local = this.phys.cup.pointToLocalFrame(this.phys.dice[i].position);
-      if (Math.hypot(local.x, local.z) > CUP_INNER_R && local.y < CUP_HEIGHT + 0.5) {
+      if (Math.hypot(local.x, local.z) > CUP_INNER_R && local.y < CUP_RIM_TOP + 0.5) {
         this.stats.rehops++;
         this.freeze(i);
         this.startHop(i, 0);
@@ -526,9 +594,9 @@ export class DiceTable {
     this.phase = 'settle';
     this.phaseT = 0;
     this.settleT = 0;
-    this.setCupCollision(false, false);
-    this.cupTargetPos.set(CUP_ASIDE.x, CUP_ASIDE.y, CUP_ASIDE.z);
-    this.cupTargetQ.set(0, 0, 0, 1);
+    // Sigue siendo sólido mientras haya dados cerca y se retira sin enderezarse aún.
+    this.setCupCollision(true, false);
+    this.cupTargetPos.set(CUP_POUR.x + 3.2, CUP_POUR.y, this.pourZ);
     for (const die of this.dice) {
       die.nudges = 0;
       die.stillT = 0;
@@ -575,22 +643,37 @@ export class DiceTable {
           this.pourFromQ.slerp(new CANNON.Quaternion(), k, this.cupTargetQ);
           break;
         }
-        // Lanzamiento: acelera hacia la izquierda mientras se inclina y frena de golpe.
+        // Lanzamiento: se inclina hacia la izquierda con un giro suave, para que el
+        // borde no vaya tan rápido como para atravesar un dado.
         this.setCupCollision(true, false);
         const since = t - this.windupTime;
         const u = Math.min(1, since / THROW_TIME);
-        const k = u * u;
+        const k = smooth(u);
         this.cupTargetPos.set(windupX + (CUP_POUR.x - windupX) * k, windupY + (CUP_POUR.y - windupY) * k, this.pourZ);
-        const extra = since > THROW_TIME ? 0.05 * Math.sin((since - THROW_TIME) * 26) : 0;
-        this.cupTargetQ.setFromAxisAngle(new CANNON.Vec3(0, 0, 1), CUP_POUR_ANGLE * k + extra);
+        // Si un dado se resiste, el cubilete se inclina más y lo sacude.
+        const held = Math.max(0, since - THROW_TIME);
+        const wobble = held > 0 ? 0.05 * Math.sin(held * 26) : 0;
+        const steeper = Math.min(STUCK_EXTRA_TILT, Math.max(0, held - 0.35) * 0.6);
+        this.cupTargetQ.setFromAxisAngle(new CANNON.Vec3(0, 0, 1), CUP_POUR_ANGLE * k + wobble + steeper);
+        if (held > STUCK_EJECT_AFTER) this.ejectStuckDice();
         this.flingExitingDice();
         this.updateInTray();
-        if (since > THROW_TIME && (this.allOutOfCup() || since >= THROW_TIME + MAX_POUR_HOLD)) this.startSettle();
+        // No se retira con un dado dentro: lo arrastraría a través de la pared.
+        if (held > 0 && this.allOutOfCup()) this.startSettle();
+        else if (held >= MAX_POUR_HOLD) {
+          this.stats.stuck++;
+          this.startSettle();
+          this.setCupCollision(false, false);
+        }
         break;
       }
 
       case 'settle':
         this.settleT += DT;
+        if (this.settleT >= RETREAT_TIME) {
+          this.cupTargetPos.set(CUP_ASIDE.x, CUP_ASIDE.y, CUP_ASIDE.z);
+          this.cupTargetQ.set(0, 0, 0, 1);
+        }
         this.updateInTray();
         this.recoverEscaped();
         if (this.settleT > 0.25 && this.allAtRest()) this.finishSettle();
@@ -620,6 +703,17 @@ export class DiceTable {
     });
   }
 
+  /** Empuja hacia la boca a los dados que siguen dentro, con su propio impulso físico. */
+  private ejectStuckDice(): void {
+    const axis = this.phys.cup.quaternion.vmult(new CANNON.Vec3(0, 1, 0));
+    this.phys.dice.forEach((b, i) => {
+      if (this.dice[i].held || !this.isInCup(b)) return;
+      if (b.velocity.dot(axis) >= 6) return;
+      b.velocity.set(axis.x * 12, axis.y * 12, axis.z * 12);
+      b.wakeUp();
+    });
+  }
+
   private updateInTray(): void {
     const m = 0.75;
     this.phys.dice.forEach((b, i) => {
@@ -640,7 +734,7 @@ export class DiceTable {
 
   private isInCup(b: CANNON.Body): boolean {
     const local = this.phys.cup.pointToLocalFrame(b.position);
-    return Math.hypot(local.x, local.z) < CUP_OUTER_R && local.y > -0.2 && local.y < CUP_HEIGHT + 0.2;
+    return Math.hypot(local.x, local.z) < CUP_OUTER_R && local.y > -0.2 && local.y < CUP_RIM_TOP + 0.2;
   }
 
   private allOutOfCup(): boolean {
@@ -686,17 +780,24 @@ export class DiceTable {
     this.phys.dice.forEach((b, i) => {
       const die = this.dice[i];
       if (die.state !== 'free') return;
+      const { dot } = readFace(b.quaternion);
+      const onFloor = b.position.y < 0.56;
+      const flat = dot >= FLAT_DOT && onFloor && die.inTray;
+      // Un dado plano que solo vibra no va a cambiar de cara: no hay que hacer esperar al jugador.
+      const tolerate = flat && this.settleT > SETTLE_NUDGE_TIME;
       const moving =
-        b.sleepState !== CANNON.Body.SLEEPING && (b.velocity.length() > 0.08 || b.angularVelocity.length() > 0.12);
+        b.sleepState !== CANNON.Body.SLEEPING &&
+        (b.velocity.length() > (tolerate ? JITTER_SPEED : 0.08) ||
+          b.angularVelocity.length() > (tolerate ? JITTER_SPEED : 0.12));
       if (moving) {
         die.stillT = 0;
         rest = false;
         return;
       }
       die.stillT += DT;
-      const { dot } = readFace(b.quaternion);
-      const onFloor = b.position.y < 0.56;
-      if (dot < FLAT_DOT || !onFloor || !die.inTray) {
+      if (flat) {
+        if (die.stillT < REST_STILL) rest = false;
+      } else {
         rest = false;
         // Al balancearse un dado se para un instante: solo se considera montado
         // sobre otro o apoyado en la pared si sigue quieto un rato.
@@ -718,7 +819,7 @@ export class DiceTable {
         });
       }
     }
-    if (!rest && this.settleT > SETTLE_NUDGE_TIME * 3) this.forceFlat();
+    if (!rest && this.settleT > SETTLE_FORCE_TIME) this.forceFlat();
     return rest;
   }
 
@@ -745,12 +846,12 @@ export class DiceTable {
 
   /** Último recurso tras un tiempo excesivo: asienta cada dado en su cara más alta. */
   private forceFlat(): void {
-    this.stats.forced++;
     this.phys.dice.forEach((b, i) => {
       const die = this.dice[i];
       if (die.state !== 'free') return;
       const { value, dot } = readFace(b.quaternion);
       if (dot >= FLAT_DOT && b.position.y < 0.56 && die.inTray) return;
+      this.stats.forced++;
       const spot = this.freeSpot(i);
       this.toResting(i, spot, quatForValue(value, Math.random() * Math.PI));
     });
@@ -759,8 +860,14 @@ export class DiceTable {
   private finishSettle(): void {
     this.phys.dice.forEach((b, i) => {
       const die = this.dice[i];
-      if (!die.held) die.value = readFace(b.quaternion).value;
+      if (die.held) return;
+      die.value = readFace(b.quaternion).value;
+      // Ya leído, nada debe poder moverlo y cambiar lo que se ve.
+      b.velocity.setZero();
+      b.angularVelocity.setZero();
+      b.sleep();
     });
+    this.setCupCollision(false, false);
     this.phase = 'idle';
     this.onSettled?.(this.dice.map((d) => d.value));
   }
@@ -806,7 +913,7 @@ export class DiceTable {
     cup.angularVelocity.set(wx, wy, wz);
 
     // La tapa acompaña al cubilete, justo por encima del borde.
-    const offset = cup.quaternion.vmult(new CANNON.Vec3(0, CUP_HEIGHT + 0.5, 0));
+    const offset = cup.quaternion.vmult(new CANNON.Vec3(0, CUP_RIM_TOP + 0.5, 0));
     lid.position.set(cup.position.x + offset.x, cup.position.y + offset.y, cup.position.z + offset.z);
     lid.quaternion.copy(cup.quaternion);
     lid.velocity.copy(cup.velocity);

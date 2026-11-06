@@ -19,16 +19,19 @@ export interface GameState {
   held: boolean[];
   rollsUsed: number;
   rolling: boolean;
+  /** Identificador de la última tirada empezada. */
+  rollId: number;
   /** Número de partida, para distinguir revanchas. */
   game: number;
 }
 
 export type Action =
   | { type: 'join'; player: Player }
-  | { type: 'rollStart' }
-  | { type: 'rollEnd'; values: number[] }
-  | { type: 'rollAbort' }
-  | { type: 'hold'; index: number }
+  /** `id` hace que repetir la acción no cuente doble; `held` fija los guardados de esta tirada. */
+  | { type: 'rollStart'; id: number; held: boolean[] }
+  | { type: 'rollEnd'; id: number; values: number[] }
+  | { type: 'rollAbort'; id: number }
+  | { type: 'hold'; index: number; held: boolean }
   | { type: 'score'; category: Category }
   | { type: 'rematch' };
 
@@ -43,11 +46,14 @@ export function createGame(host: Player): GameState {
     held: [false, false, false, false, false],
     rollsUsed: 0,
     rolling: false,
+    rollId: 0,
     game: 1,
   };
 }
 
 const isDie = (v: unknown) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 6;
+const isHeldMask = (v: unknown): v is boolean[] =>
+  Array.isArray(v) && v.length === 5 && v.every((h) => typeof h === 'boolean');
 
 export function canRoll(s: GameState): boolean {
   return s.phase === 'playing' && !s.rolling && s.rollsUsed < MAX_ROLLS && !s.held.every(Boolean);
@@ -97,25 +103,32 @@ export function reduce(s: GameState, by: Seat, a: Action): GameState | null {
   if (by !== s.current) return null;
 
   switch (a.type) {
-    case 'rollStart':
-      if (!canRoll(s)) return null;
-      return { ...s, rolling: true, rollsUsed: s.rollsUsed + 1 };
+    case 'rollStart': {
+      if (a.id === s.rollId) return s;
+      if (!Number.isFinite(a.id) || !isHeldMask(a.held)) return null;
+      // No se puede guardar nada antes de la primera tirada, ni tirar sin dados libres.
+      if (s.rollsUsed === 0 && a.held.some(Boolean)) return null;
+      const next = { ...s, held: [...a.held] };
+      if (!canRoll(next)) return null;
+      return { ...next, rolling: true, rollsUsed: s.rollsUsed + 1, rollId: a.id };
+    }
 
     case 'rollEnd':
-      if (s.phase !== 'playing' || !s.rolling) return null;
+      if (s.phase !== 'playing' || a.id !== s.rollId) return null;
+      if (!s.rolling) return s;
       if (!Array.isArray(a.values) || a.values.length !== 5 || !a.values.every(isDie)) return null;
       // Los dados guardados no pueden cambiar de valor.
       if (s.held.some((h, i) => h && a.values[i] !== s.dice[i])) return null;
       return { ...s, rolling: false, dice: [...a.values] };
 
     case 'rollAbort':
-      if (s.phase !== 'playing' || !s.rolling) return null;
+      if (s.phase !== 'playing' || !s.rolling || a.id !== s.rollId) return null;
       return { ...s, rolling: false, rollsUsed: s.rollsUsed - 1 };
 
     case 'hold': {
       if (!canHold(s) || !Number.isInteger(a.index) || a.index < 0 || a.index > 4) return null;
       const held = [...s.held];
-      held[a.index] = !held[a.index];
+      held[a.index] = !!a.held;
       return { ...s, held };
     }
 
